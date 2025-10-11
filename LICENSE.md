@@ -1,4 +1,4 @@
-Copyright (c) 2025 Arturo Ortgea Salinas
+Copyright (c) 2025 Arturo Ortega Salinas
 **ALL RIGHTS RESERVED**
 
 This software and its source code, including but not limited to the `EnterpriseSales1.9.json` file (hereinafter referred to as "the Software"), 
