@@ -1,0 +1,1532 @@
+{
+    "name": "Enterprise Sales 2.0",
+    "nodes": [
+        {
+            "parameters": {
+                "jsCode": "// âœ… REAL VALIDATION WITHOUT EXTERNAL LIBRARIES\ntry {\n const { email, password } = $json.body;\n \n // Basic validation\n if (!email || !password) {\n return {\n success: false,\n error: 'Email and password are required',\n statusCode: 400\n };\n }\n \n // Validate email format with native regex\n const emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n if (!emailRegex.test(email)) {\n return {\n success: false,\n error: 'Invalid email format',\n statusCode: 400\n };\n }\n \n // Basic rate limiting with timestamp\n const clientIP = $json.headers['x-forwarded-for'] || 'unknown';\n const rateLimitKey = `rate_limit_${clientIP}`;\n \n return {\n email: email.toLowerCase().trim(),\n password,\n clientIP,\n userAgent: $json.headers['user-agent'] || 'unknown',\n timestamp: new Date().toISOString()\n };\n \n} catch (error) {\n return {\n success: false,\n error: 'Error validating input',\n statusCode: 500\n };\n}"
+            },
+            "id": "94fcf5ef-3d89-4359-9a11-41f3c7b75cb4",
+            "name": "Validate Input",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1264,
+                112
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "incr",
+                "key": "={{ 'ratelimit_' + $json.clientIP + '_' + ($json.userAgent || '').slice(0, 50) }}"
+            },
+            "id": "redis-rate-limit-incr",
+            "name": "Redis - Rate Limit Incr",
+            "type": "n8n-nodes-base.redis",
+            "typeVersion": 1,
+            "position": [
+                1300,
+                112
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "expire",
+                "key": "={{ 'ratelimit_' + $('Validate Input').first().json.clientIP + '_' + ($('Validate Input').first().json.userAgent || '').slice(0, 50) }}",
+                "ttl": 60
+            },
+            "id": "redis-rate-limit-ttl",
+            "name": "Redis - Rate Limit TTL",
+            "type": "n8n-nodes-base.redis",
+            "typeVersion": 1,
+            "position": [
+                1350,
+                112
+            ]
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "check-rate-limit",
+                            "leftValue": "={{ parseInt($('Redis - Rate Limit Incr').first().json.value) }}",
+                            "rightValue": 5,
+                            "operator": {
+                                "type": "number",
+                                "operation": "gt"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                }
+            },
+            "id": "if-rate-limit-exceeded",
+            "name": "Rate Limit Exceeded?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                1400,
+                112
+            ]
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ { success: false, error: 'Rate limit exceeded. Try again later.', statusCode: 429 } }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "response-rate-limit",
+            "name": "Response - Rate Limit",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                1400,
+                250
+            ]
+        },
+        {
+            "parameters": {
+                "url": "={{ $env.SUPABASE_URL }}/auth/v1/token?grant_type=password",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "apikey",
+                            "value": "={{ $env.SUPABASE_ANON_KEY }}"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "bodyParameters": {
+                    "parameters": [
+                        {
+                            "name": "email",
+                            "value": "={{ $json.email }}"
+                        },
+                        {
+                            "name": "password",
+                            "value": "={{ $json.password }}"
+                        }
+                    ]
+                },
+                "options": {
+                    "timeout": 10000
+                }
+            },
+            "id": "7263f8c2-f000-4c6e-be53-9ee1add232d4",
+            "name": "Supabase Auth - Login",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                1472,
+                112
+            ],
+            "continueOnFail": true,
+            "onError": "continueErrorOutput"
+        },
+        {
+            "parameters": {
+                "jsCode": "// âœ… PROCESS SUPABASE RESPONSE\ntry {\n const authResponse = $json;\n \n if (authResponse.error) {\n return {\n success: false,\n error: authResponse.error_description || 'Invalid credentials',\n statusCode: 401\n };\n }\n \n // Supabase returns the token directly\n const { access_token, refresh_token, user } = authResponse;\n \n if (!access_token || !user) {\n return {\n success: false,\n error: 'Authentication response error',\n statusCode: 500\n };\n }\n \n // Get additional user data from our DB\n return {\n success: true,\n user: {\n id: user.id,\n email: user.email,\n role: user.user_metadata?.role || 'seller',\n company_id: user.user_metadata?.company_id || 1,\n profile: user.user_metadata?.profile || {}\n },\n tokens: {\n accessToken: access_token,\n refreshToken: refresh_token\n },\n expiresIn: authResponse.expires_in\n };\n \n} catch (error) {\n return {\n success: false,\n error: 'Error processing authentication',\n statusCode: 500\n };\n}"
+            },
+            "id": "0565e22a-1cff-4d08-ac79-37b79a1a095f",
+            "name": "Process Auth",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1664,
+                112
+            ]
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "check-error",
+                            "leftValue": "={{ $json.error }}",
+                            "rightValue": "",
+                            "operator": {
+                                "type": "string",
+                                "operation": "notExists"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "if-no-error-auth",
+            "name": "Auth No Errors",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                1872,
+                112
+            ]
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ $json }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "Access-Control-Allow-Origin",
+                                "value": "={{ $env.FRONTEND_URL || 'https://app.enterprise.com' }}"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "7782e060-9c4f-4e13-a8c8-b03ca2bdecb8",
+            "name": "Response - Auth Success",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                2064,
+                112
+            ]
+        },
+        {
+            "parameters": {
+                "url": "https://api.datadoghq.com/api/v1/logs",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "DD-API-KEY",
+                            "value": "={{ $env.DATADOG_API_KEY }}"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "bodyParameters": {
+                    "parameters": [
+                        {
+                            "name": "message",
+                            "value": "={{ $json.error_message || $json.error }}"
+                        },
+                        {
+                            "name": "ddsource",
+                            "value": "n8n"
+                        },
+                        {
+                            "name": "service",
+                            "value": "enterprise-sales"
+                        },
+                        {
+                            "name": "status",
+                            "value": "error"
+                        },
+                        {
+                            "name": "additional_data",
+                            "value": "={{ JSON.stringify($json) }}"
+                        }
+                    ]
+                },
+                "options": {}
+            },
+            "id": "error-logging-node",
+            "name": "Log Error",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                2272,
+                200
+            ],
+            "continueOnFail": true
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ { success: false, error: $json.error, statusCode: $json.statusCode } }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "error-response-auth",
+            "name": "Response - Auth Error",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                2464,
+                200
+            ]
+        },
+        {
+            "parameters": {
+                "httpMethod": "POST",
+                "path": "api/auth/login",
+                "responseMode": "responseNode",
+                "options": {}
+            },
+            "id": "2d875511-251f-4446-9358-132267935314",
+            "name": "Webhook - Login",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 1.1,
+            "position": [
+                1072,
+                112
+            ],
+            "webhookId": "login-real-webhook"
+        },
+        {
+            "parameters": {
+                "httpMethod": "POST",
+                "path": "api/sales",
+                "responseMode": "responseNode",
+                "options": {}
+            },
+            "id": "70385edb-d7e0-480e-ba90-98771cd1a393",
+            "name": "Webhook - Create Sale",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 1.1,
+            "position": [
+                1072,
+                304
+            ],
+            "webhookId": "create-sale-real-webhook"
+        },
+        {
+            "parameters": {
+                "jsCode": "// âœ… EXTRACT AND VALIDATE TOKEN (Supabase validates)\ntry {\n const authHeader = $json.headers.authorization;\n \n if (!authHeader || !authHeader.startsWith('Bearer ')) {\n return {\n success: false,\n error: 'Authorization token required',\n statusCode: 401\n };\n }\n\n const token = authHeader.substring(7);\n const idempotencyKey = $json.headers['idempotency-key'];\n \n if (!idempotencyKey) {\n return {\n success: false,\n error: 'Idempotency-key header is required',\n statusCode: 400\n };\n }\n \n // Extract real IP (first IP in x-forwarded-for)\n const clientIP = $json.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';\n const userAgent = $json.headers['user-agent'] || 'unknown';\n \n return {\n token,\n saleData: $json.body,\n idempotencyKey,\n clientIP,\n userAgent\n };\n \n} catch (error) {\n return {\n success: false,\n error: 'Error validating token',\n statusCode: 500\n };\n}"
+            },
+            "id": "d429ac10-f082-4e11-b7df-f59c01b3de0c",
+            "name": "Validate Token",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1264,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "url": "={{ $env.SUPABASE_URL }}/auth/v1/user",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer {{ $json.token }}"
+                        },
+                        {
+                            "name": "apikey",
+                            "value": "={{ $env.SUPABASE_ANON_KEY }}"
+                        }
+                    ]
+                },
+                "options": {
+                    "timeout": 10000
+                }
+            },
+            "id": "b868327e-b7c2-41c3-b571-009a65acae84",
+            "name": "Supabase - Validate Token",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                1472,
+                304
+            ],
+            "continueOnFail": true,
+            "onError": "continueErrorOutput"
+        },
+        {
+            "parameters": {
+                "operation": "set",
+                "key": "={{ 'idempotency_' + $('Webhook - Create Sale').first().json.headers['idempotency-key'] }}",
+                "value": "PROCESSING",
+                "options": {
+                    "expire": 300,
+                    "setMode": "NX"
+                }
+            },
+            "id": "redis-setnx",
+            "name": "Redis - SETNX",
+            "type": "n8n-nodes-base.redis",
+            "typeVersion": 1,
+            "position": [
+                1550,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "get",
+                "key": "={{ 'idempotency_' + $('Webhook - Create Sale').first().json.headers['idempotency-key'] }}"
+            },
+            "id": "redis-get-cached",
+            "name": "Redis - GET Cached",
+            "type": "n8n-nodes-base.redis",
+            "typeVersion": 1,
+            "position": [
+                1600,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "jsCode": "\ntry {\n const setnxResult = $('Redis - SETNX').first().json;\n \n // If SETNX returns OK, the key was created (did not exist)\n if (setnxResult === 'OK' || setnxResult.value === 'PROCESSING') {\n return {\n cached: false,\n proceed: true\n };\n }\n \n // If we get here, the key already existed\n const cachedValue = $('Redis - GET Cached').first().json.value;\n \n if (cachedValue === 'PROCESSING') {\n return {\n success: false,\n error: 'Request is already being processed',\n statusCode: 409\n };\n }\n \n return {\n cached: true,\n result: JSON.parse(cachedValue)\n };\n \n} catch (error) {\n return {\n success: false,\n error: 'Error verifying idempotency',\n statusCode: 500\n };\n}\n "
+            },
+            "id": "process-idempotency",
+            "name": "Process Idempotency",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1650,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "check-idempotency",
+                            "leftValue": "={{ $json.cached }}",
+                            "rightValue": true,
+                            "operator": {
+                                "type": "boolean",
+                                "operation": "equals"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                }
+            },
+            "id": "if-idempotency-exists",
+            "name": "Idempotency Exists?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                1700,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ $json.result }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "X-Idempotency-Hit",
+                                "value": "true"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "response-cached",
+            "name": "Response - Cached",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                1900,
+                150
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "executeQuery",
+                "query": "SELECT p.id, p.name, p.price, p.sku, i.quantity, i.reserved FROM products p LEFT JOIN inventory i ON p.id = i.product_id WHERE p.id = ANY($1) AND p.is_active = true AND p.company_id = $2",
+                "options": {
+                    "queryParameters": {
+                        "parameters": [
+                            {
+                                "name": "product_ids",
+                                "value": "={{ '{' + $json.saleData.items.map(i => i.product_id).join(',') + '}' }}"
+                            },
+                            {
+                                "name": "company_id",
+                                "value": "={{ $json.user.user_metadata.company_id }}"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "d690121f-96b5-407a-bab7-db66fbfd2dac",
+            "name": "Verify Inventory Secure",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.4,
+            "position": [
+                1664,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "jsCode": "// âœ… PROCESS SALE WITH ROBUST VALIDATION\ntry {\n const products = $('Verify Inventory Secure').all().map(item => item.json);\n const saleData = $json.saleData;\n const user = $json.user;\n \n // âœ… ROBUST INPUT DATA VALIDATION\n \n // Validate basic structure\n if (!saleData || typeof saleData !== 'object') {\n throw new Error('saleData must be a valid object');\n }\n \n // Validate items\n if (!saleData.items || !Array.isArray(saleData.items) || saleData.items.length === 0) {\n throw new Error('items must be a non-empty array');\n }\n\n // âœ… NEW: Validate item limits\n if (saleData.items.length > 100) {\n throw new Error('Maximum 100 items per sale');\n }\n \n // Validate each item individually\n for (let i = 0; i < saleData.items.length; i++) {\n const item = saleData.items[i];\n \n // Validate product_id\n if (!Number.isInteger(item.product_id) || item.product_id <= 0) {\n throw new Error(`Item ${i}: invalid product_id: ${item.product_id}. Must be a positive integer.`);\n }\n \n // Validate quantity\n if (!Number.isInteger(item.quantity) || item.quantity <= 0) {\n throw new Error(`Item ${i}: invalid quantity: ${item.quantity}. Must be a positive integer.`);\n }\n\n // âœ… NEW: Validate quantity range\n if (item.quantity > 10000) {\n throw new Error(`Item ${i}: Maximum quantity: 10,000 units`);\n }\n \n // Validate unit_price\n if (typeof item.unit_price !== 'number' || item.unit_price <= 0 || !isFinite(item.unit_price)) {\n throw new Error(`Item ${i}: invalid unit_price: ${item.unit_price}. Must be a positive finite number.`);\n }\n\n // âœ… NEW: Validate price range\n if (item.unit_price > 1000000) {\n throw new Error(`Item ${i}: Maximum price: $1,000,000`);\n }\n }\n \n // Validate customer_info\n if (!saleData.customer_info || typeof saleData.customer_info !== 'object') {\n throw new Error('customer_info is required and must be an object');\n }\n \n if (!saleData.customer_info.name || typeof saleData.customer_info.name !== 'string' || saleData.customer_info.name.trim() === '') {\n throw new Error('customer_info.name is required and cannot be empty');\n }\n\n // âœ… NEW: Sanitize name\n const sanitizeName = (name) => {\n return name\n .replace(/[<>\\'\"\\\\]/g, '') // Remove dangerous characters\n .replace(/\\s+/g, ' ') // Normalize spaces\n .trim()\n .slice(0, 255); // Limit length\n };\n \n // Validate email if provided\n if (saleData.customer_info.email) {\n const emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n if (!emailRegex.test(saleData.customer_info.email)) {\n throw new Error('customer_info.email has invalid format');\n }\n }\n \n // Validate payment_method\n const validPaymentMethods = ($env.PAYMENT_METHODS || 'cash,card,transfer,check').split(',');\n if (saleData.payment_method && !validPaymentMethods.includes(saleData.payment_method)) {\n throw new Error(`invalid payment_method: ${saleData.payment_method}. Valid values: ${validPaymentMethods.join(', ')}`);\n }\n \n // âœ… VERIFY INVENTORY\n const inventoryCheck = {};\n for (const product of products) {\n inventoryCheck[product.id] = {\n available: product.quantity - product.reserved,\n product: product\n };\n }\n \n const unavailableItems = [];\n let totalAmount = 0;\n \n for (const item of saleData.items) {\n const inventory = inventoryCheck[item.product_id];\n if (!inventory || inventory.available < item.quantity) {\n unavailableItems.push({\n product_id: item.product_id,\n requested: item.quantity,\n available: inventory ? inventory.available : 0,\n product_name: inventory ? inventory.product.name : 'Not found'\n });\n }\n \n totalAmount += item.quantity * item.unit_price;\n }\n \n if (unavailableItems.length > 0) {\n return {\n success: false,\n error: 'Insufficient inventory',\n unavailableItems,\n statusCode: 400\n };\n }\n \n // âœ… CALCULATE TOTALS\n const taxRate = parseFloat($env.TAX_RATE || 0.16);\n const taxAmount = Math.round(totalAmount * taxRate * 100) / 100; // Round to 2 decimal places\n const finalTotal = Math.round((totalAmount + taxAmount) * 100) / 100;\n \n // Generate unique invoice number\n const timestamp = Date.now();\n const randomSuffix = Math.floor(Math.random() * 1000).toString().padStart(3, '0');\n const invoiceNumber = `F-${new Date().getFullYear()}-${timestamp.toString().slice(-6)}-${randomSuffix}`;\n \n return {\n company_id: user.user_metadata?.company_id || 1,\n user_id: user.id,\n customer_info: {\n name: sanitizeName(saleData.customer_info.name),\n email: saleData.customer_info.email?.trim().toLowerCase().slice(0, 255) || null,\n phone: saleData.customer_info.phone?.replace(/[^\\d+\\-() ]/g, '').slice(0, 20) || null\n },\n invoice_number: invoiceNumber,\n total_amount: totalAmount,\n tax_amount: taxAmount,\n final_total: finalTotal,\n payment_method: saleData.payment_method || 'cash',\n items: saleData.items,\n metadata: {\n ip: $json.clientIP,\n user_agent: $json.userAgent,\n timestamp: new Date().toISOString(),\n validation_passed: true\n }\n };\n \n} catch (error) {\n return {\n success: false,\n error: error.message || 'Error processing sale',\n statusCode: 400,\n validation_error: true\n };\n}"
+            },
+            "id": "d5a64843-b13e-44b9-aacb-6e47e99a8e79",
+            "name": "Process Sale Secure",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1872,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "executeQuery",
+                "query": "SELECT * FROM create_sale_with_inventory_update(\n $1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9::jsonb, \n $10::int[], $11::int[], $12::decimal[], $13::decimal[]\n);",
+                "options": {
+                    "timeout": 15000,
+                    "queryParameters": {
+                        "parameters": [
+                            {
+                                "name": "company_id",
+                                "value": "={{ $json.company_id }}"
+                            },
+                            {
+                                "name": "user_id",
+                                "value": "={{ $json.user_id }}"
+                            },
+                            {
+                                "name": "customer_info",
+                                "value": "={{ JSON.stringify($json.customer_info) }}"
+                            },
+                            {
+                                "name": "invoice_number",
+                                "value": "={{ $json.invoice_number }}"
+                            },
+                            {
+                                "name": "total_amount",
+                                "value": "={{ $json.total_amount }}"
+                            },
+                            {
+                                "name": "tax_amount",
+                                "value": "={{ $json.tax_amount }}"
+                            },
+                            {
+                                "name": "final_total",
+                                "value": "={{ $json.final_total }}"
+                            },
+                            {
+                                "name": "payment_method",
+                                "value": "={{ $json.payment_method }}"
+                            },
+                            {
+                                "name": "metadata",
+                                "value": "={{ JSON.stringify($json.metadata) }}"
+                            },
+                            {
+                                "name": "product_ids",
+                                "value": "={{ '{' + $json.items.map(i => i.product_id).join(',') + '}' }}"
+                            },
+                            {
+                                "name": "quantities",
+                                "value": "={{ '{' + $json.items.map(i => i.quantity).join(',') + '}' }}"
+                            },
+                            {
+                                "name": "unit_prices",
+                                "value": "={{ '{' + $json.items.map(i => i.unit_price).join(',') + '}' }}"
+                            },
+                            {
+                                "name": "totals",
+                                "value": "={{ '{' + $json.items.map(i => (i.quantity * i.unit_price)).join(',') + '}' }}"
+                            }
+                        ]
+                    }
+                },
+                "alwaysOutputData": true
+            },
+            "id": "f6723456-7890-1234-5678-90abcdef1234",
+            "name": "Create Sale Transaction SECURE",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.4,
+            "position": [
+                2072,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "jsCode": "\ntry {\n const result = $json;\n const processedSale = $('Process Sale Secure').first().json;\n \n // Validate that the function returned success\n if (!result.success || !result.sale_id) {\n return {\n success: false,\n error: result.error_message || 'Sale transaction error',\n statusCode: 500\n };\n }\n \n // All good, prepare response\n return {\n success: true,\n sale_id: result.sale_id,\n invoice_number: processedSale.invoice_number,\n final_total: processedSale.final_total,\n payment_method: processedSale.payment_method\n };\n \n} catch (error) {\n return {\n success: false,\n error: error.message || 'Error validating sale result',\n statusCode: 500\n };\n}\n "
+            },
+            "id": "validate-function-result",
+            "name": "Validate Function Result",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                2150,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "check-transaction-id",
+                            "leftValue": "={{ $json.success }}",
+                            "rightValue": true,
+                            "operator": {
+                                "type": "boolean",
+                                "operation": "equals"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                }
+            },
+            "id": "if-transaction-success",
+            "name": "Transaction Successful?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                2250,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ {\n success: false,\n error: \"Inventory conflict: Stock changed while processing the sale.\",\n code: \"INVENTORY_RACE_CONDITION\",\n statusCode: 409\n} }}",
+                "options": {
+                    "responseCode": 409,
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "response-race-condition",
+            "name": "Response - Race Condition",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                2450,
+                500
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "set",
+                "key": "={{ 'idempotency_' + $('Webhook - Create Sale').first().json.headers['idempotency-key'] }}",
+                "value": "={{ JSON.stringify({ success: true, invoiceNumber: $json.invoice_number, totalAmount: $json.final_total, message: 'Sale registered successfully' }) }}",
+                "ttl": 86400
+            },
+            "id": "redis-save-idempotency",
+            "name": "Redis - Save Idempotency",
+            "type": "n8n-nodes-base.redis",
+            "typeVersion": 1,
+            "position": [
+                2172,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "check-error-sale",
+                            "leftValue": "={{ $json.error }}",
+                            "rightValue": "",
+                            "operator": {
+                                "type": "string",
+                                "operation": "notExists"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "if-no-error-sale",
+            "name": "Sale No Errors",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                2272,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ { success: true, invoiceNumber: $json.invoice_number, totalAmount: $json.final_total, message: 'Sale registered successfully' } }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "807c0d79-062c-4ef8-a069-4b1d2bfa9277",
+            "name": "Response - Sale Success",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                2464,
+                304
+            ]
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ { success: false, error: $json.error, statusCode: $json.statusCode } }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "error-response-sale",
+            "name": "Response - Sale Error",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                2464,
+                400
+            ]
+        },
+        {
+            "parameters": {
+                "path": "api/reports/sales",
+                "responseMode": "responseNode",
+                "options": {}
+            },
+            "id": "4291914f-3873-4160-b5af-524c2247d595",
+            "name": "Webhook - Report",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 1.1,
+            "position": [
+                1072,
+                512
+            ],
+            "webhookId": "report-real-webhook"
+        },
+        {
+            "parameters": {
+                "jsCode": "// Validate JWT token\ntry {\n const authHeader = $json.headers.authorization;\n \n if (!authHeader || !authHeader.startsWith('Bearer ')) {\n return {\n success: false,\n error: 'Authorization token required',\n statusCode: 401\n };\n }\n \n const token = authHeader.substring(7);\n \n return {\n token,\n query: $json.query,\n clientIP: $json.headers['x-forwarded-for'] || 'unknown'\n };\n \n} catch (error) {\n return {\n success: false,\n error: 'Error validating token',\n statusCode: 500\n };\n}"
+            },
+            "id": "code-validate-token-reports",
+            "name": "Validate Token Reports",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1264,
+                512
+            ]
+        },
+        {
+            "parameters": {
+                "url": "={{ $env.SUPABASE_URL }}/auth/v1/user",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer {{ $json.token }}"
+                        },
+                        {
+                            "name": "apikey",
+                            "value": "={{ $env.SUPABASE_ANON_KEY }}"
+                        }
+                    ]
+                },
+                "options": {
+                    "timeout": 10000
+                }
+            },
+            "id": "supabase-validate-token-reports",
+            "name": "Supabase - Validate Token Reports",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                1472,
+                512
+            ],
+            "continueOnFail": true,
+            "onError": "continueErrorOutput"
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ { success: true, message: 'Report generation started', jobId: $execution.id, status: 'processing' } }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "7e8e64f5-eaf2-437c-bfb2-c846c34159c2",
+            "name": "Response - Report Generated",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                1550,
+                512
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "executeQuery",
+                "query": "SELECT s.id, s.invoice_number, s.total_amount, s.final_total, s.payment_method, s.created_at, u.profile->>'name' as seller_name, c.name as customer_name FROM sales s LEFT JOIN users u ON s.user_id = u.id LEFT JOIN customers c ON s.customer_id = c.id WHERE s.company_id = $1 AND s.created_at >= $2 AND s.created_at <= $3 ORDER BY s.created_at DESC LIMIT $4 OFFSET $5",
+                "options": {
+                    "queryParameters": {
+                        "parameters": [
+                            {
+                                "name": "company_id",
+                                "value": "={{ $json.query.company_id || 1 }}"
+                            },
+                            {
+                                "name": "start_date",
+                                "value": "={{ $json.query.start_date || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] }}"
+                            },
+                            {
+                                "name": "end_date",
+                                "value": "={{ $json.query.end_date || new Date().toISOString().split('T')[0] }}"
+                            },
+                            {
+                                "name": "limit",
+                                "value": "={{ Math.min(parseInt($json.query.limit) || 1000, 10000) }}"
+                            },
+                            {
+                                "name": "offset",
+                                "value": "={{ parseInt($json.query.offset) || 0 }}"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "a2bb5153-e32e-4933-8f77-a080db450814",
+            "name": "Get Report Secure",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.4,
+            "position": [
+                1664,
+                512
+            ]
+        },
+        {
+            "parameters": {
+                "url": "https://api.cloudconvert.com/v2/jobs",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer {{ $env.CLOUDCONVERT_API_KEY }}"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "bodyParameters": {
+                    "parameters": [
+                        {
+                            "name": "tasks",
+                            "value": "={{ JSON.stringify({ 'export-json': { 'operation': 'export/json', 'input': $('Get Report Secure').all().map(item => item.json), 'output_format': 'xlsx' } }) }}"
+                        }
+                    ]
+                },
+                "options": {}
+            },
+            "id": "21f59c20-7d65-4512-a45e-e8e0b9028ba4",
+            "name": "CloudConvert - Generate Excel",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                1872,
+                512
+            ],
+            "continueOnFail": true
+        },
+        {
+            "parameters": {
+                "rule": {
+                    "interval": [
+                        {
+                            "field": "cronExpression",
+                            "expression": "0 2 * * *"
+                        }
+                    ]
+                }
+            },
+            "id": "998ff1b1-6d30-4872-b97a-89f9866b04ad",
+            "name": "Schedule - Backup",
+            "type": "n8n-nodes-base.scheduleTrigger",
+            "typeVersion": 1.1,
+            "position": [
+                1072,
+                704
+            ]
+        },
+        {
+            "parameters": {
+                "command": "=/bin/bash",
+                "arguments": "-c \"export DB_NAME=\\\"${DB_NAME:-sales}\\\"; if [[ ! \\\"$DB_NAME\\\" =~ ^[a-zA-Z0-9_-]+$ ]]; then echo 'Invalid DB_NAME'; exit 1; fi; export BACKUP_FILE=\\\"/tmp/backup_$(date +%Y%m%d_%H%M%S).dump\\\"; pg_dump -h ${DB_HOST:-localhost} -U ${DB_USER:-postgres} -d $DB_NAME -F c -f $BACKUP_FILE && [ -s $BACKUP_FILE ] && echo 'Backup completed successfully' || echo 'Backup error'\"",
+                "options": {
+                    "env": {
+                        "DB_HOST": "={{ $env.DB_HOST || 'localhost' }}",
+                        "DB_USER": "={{ $env.DB_USER || 'postgres' }}",
+                        "DB_NAME": "={{ $env.DB_NAME || 'sales' }}",
+                        "PGPASSWORD": "={{ $env.DB_PASSWORD }}"
+                    }
+                }
+            },
+            "id": "d8609031-c23a-4280-a6d9-8c6752f7c4e1",
+            "name": "Execute - Backup",
+            "type": "n8n-nodes-base.executeCommand",
+            "typeVersion": 1,
+            "position": [
+                1264,
+                704
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "executeQuery",
+                "query": "INSERT INTO backup_logs (filename, file_path, file_size, file_hash, backup_type, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+                "options": {
+                    "queryParameters": {
+                        "parameters": [
+                            {
+                                "name": "filename",
+                                "value": "={{ 'backup_' + new Date().toISOString().slice(0,10).replace(/-/g,'') + '_' + new Date().toISOString().slice(11,19).replace(/:/g,'') + '.dump' }}"
+                            },
+                            {
+                                "name": "file_path",
+                                "value": "={{ '/tmp/backup_' + new Date().toISOString().slice(0,10).replace(/-/g,'') + '_' + new Date().toISOString().slice(11,19).replace(/:/g,'') + '.dump' }}"
+                            },
+                            {
+                                "name": "file_size",
+                                "value": "={{ $json.stdout?.match(/Backup completed successfully/) ? 'SUCCESS' : 'UNKNOWN' }}"
+                            },
+                            {
+                                "name": "file_hash",
+                                "value": "={{ 'hash_' + Date.now() }}"
+                            },
+                            {
+                                "name": "backup_type",
+                                "value": "daily_automated"
+                            },
+                            {
+                                "name": "status",
+                                "value": "={{ $json.stdout?.match(/Backup completed successfully/) ? 'success' : 'failed' }}"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "d439c3b2-c1ac-4ec7-a240-6a1cb629d092",
+            "name": "Log Backup",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.4,
+            "position": [
+                1472,
+                704
+            ]
+        },
+        {
+            "parameters": {
+                "path": "api/health",
+                "responseMode": "responseNode",
+                "options": {}
+            },
+            "id": "21419b23-ba40-4a9a-8c78-4a8331ea9ac7",
+            "name": "Webhook - Health",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 1.1,
+            "position": [
+                1072,
+                912
+            ],
+            "webhookId": "health-real-webhook"
+        },
+        {
+            "parameters": {
+                "operation": "executeQuery",
+                "query": "SELECT 1 as health_check",
+                "options": {}
+            },
+            "id": "c5b652e7-92ff-48e1-947d-481a5aaf0d89",
+            "name": "PostgreSQL - Health Check",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.4,
+            "position": [
+                1264,
+                912
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "ping"
+            },
+            "id": "7117844f-ccce-43a5-9758-46e33df97c82",
+            "name": "Redis - Health Check",
+            "type": "n8n-nodes-base.redis",
+            "typeVersion": 1,
+            "position": [
+                1472,
+                912
+            ]
+        },
+        {
+            "parameters": {
+                "jsCode": "// âœ… REAL HEALTH CHECK\ntry {\n const dbHealth = $('PostgreSQL - Health Check').first().json;\n const redisHealth = $('Redis - Health Check').first().json;\n \n const overallStatus = (dbHealth && redisHealth) ? 'healthy' : 'unhealthy';\n \n return {\n status: overallStatus,\n timestamp: new Date().toISOString(),\n services: {\n database: {\n status: dbHealth ? 'healthy' : 'unhealthy'\n },\n redis: {\n status: redisHealth ? 'healthy' : 'unhealthy'\n }\n },\n version: '1.0.0'\n };\n \n} catch (error) {\n return {\n status: 'unhealthy',\n timestamp: new Date().toISOString(),\n error: error.message\n };\n}"
+            },
+            "id": "a327826b-b289-4e00-9571-85e1ba7d5c93",
+            "name": "Health Check",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1664,
+                912
+            ]
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{ $json }}",
+                "options": {
+                    "responseHeaders": {
+                        "entries": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "Cache-Control",
+                                "value": "no-cache"
+                            }
+                        ]
+                    }
+                }
+            },
+            "id": "c3dacf0f-1eec-4cfa-bfcd-f70da0fac1fd",
+            "name": "Response - Health",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                1872,
+                912
+            ]
+        }
+    ],
+    "connections": {
+        "Webhook - Login": {
+            "main": [
+                [
+                    {
+                        "node": "Validate Input",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Validate Input": {
+            "main": [
+                [
+                    {
+                        "node": "Redis - Rate Limit Incr",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Redis - Rate Limit Incr": {
+            "main": [
+                [
+                    {
+                        "node": "Redis - Rate Limit TTL",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Redis - Rate Limit TTL": {
+            "main": [
+                [
+                    {
+                        "node": "Rate Limit Exceeded?",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Rate Limit Exceeded?": {
+            "main": [
+                [
+                    {
+                        "node": "Response - Rate Limit",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Supabase Auth - Login",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Supabase Auth - Login": {
+            "main": [
+                [
+                    {
+                        "node": "Process Auth",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Process Auth": {
+            "main": [
+                [
+                    {
+                        "node": "Auth No Errors",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Auth No Errors": {
+            "main": [
+                [
+                    {
+                        "node": "Response - Auth Success",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Log Error",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Log Error": {
+            "main": [
+                [
+                    {
+                        "node": "Response - Auth Error",
+                        "type": "main",
+                        "index": 0
+                    },
+                    {
+                        "node": "Response - Sale Error",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Webhook - Create Sale": {
+            "main": [
+                [
+                    {
+                        "node": "Validate Token",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Validate Token": {
+            "main": [
+                [
+                    {
+                        "node": "Supabase - Validate Token",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Supabase - Validate Token": {
+            "main": [
+                [
+                    {
+                        "node": "Redis - SETNX",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Redis - SETNX": {
+            "main": [
+                [
+                    {
+                        "node": "Redis - GET Cached",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Redis - GET Cached": {
+            "main": [
+                [
+                    {
+                        "node": "Process Idempotency",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Process Idempotency": {
+            "main": [
+                [
+                    {
+                        "node": "Idempotency Exists?",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Idempotency Exists?": {
+            "main": [
+                [
+                    {
+                        "node": "Response - Cached",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Verify Inventory Secure",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Verify Inventory Secure": {
+            "main": [
+                [
+                    {
+                        "node": "Process Sale Secure",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Process Sale Secure": {
+            "main": [
+                [
+                    {
+                        "node": "Create Sale Transaction SECURE",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Create Sale Transaction SECURE": {
+            "main": [
+                [
+                    {
+                        "node": "Validate Function Result",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Validate Function Result": {
+            "main": [
+                [
+                    {
+                        "node": "Transaction Successful?",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Transaction Successful?": {
+            "main": [
+                [
+                    {
+                        "node": "Redis - Save Idempotency",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Response - Race Condition",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Redis - Save Idempotency": {
+            "main": [
+                [
+                    {
+                        "node": "Sale No Errors",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Sale No Errors": {
+            "main": [
+                [
+                    {
+                        "node": "Response - Sale Success",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Log Error",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Webhook - Report": {
+            "main": [
+                [
+                    {
+                        "node": "Validate Token Reports",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Validate Token Reports": {
+            "main": [
+                [
+                    {
+                        "node": "Supabase - Validate Token Reports",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Supabase - Validate Token Reports": {
+            "main": [
+                [
+                    {
+                        "node": "Response - Report Generated",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Response - Report Generated": {
+            "main": [
+                [
+                    {
+                        "node": "Get Report Secure",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Get Report Secure": {
+            "main": [
+                [
+                    {
+                        "node": "CloudConvert - Generate Excel",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "CloudConvert - Generate Excel": {
+            "main": [
+                []
+            ]
+        },
+        "Schedule - Backup": {
+            "main": [
+                [
+                    {
+                        "node": "Execute - Backup",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Execute - Backup": {
+            "main": [
+                [
+                    {
+                        "node": "Log Backup",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Webhook - Health": {
+            "main": [
+                [
+                    {
+                        "node": "PostgreSQL - Health Check",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "PostgreSQL - Health Check": {
+            "main": [
+                [
+                    {
+                        "node": "Redis - Health Check",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Redis - Health Check": {
+            "main": [
+                [
+                    {
+                        "node": "Health Check",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Health Check": {
+            "main": [
+                [
+                    {
+                        "node": "Response - Health",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        }
+    },
+    "active": false,
+    "settings": {
+        "executionOrder": "v1"
+    },
+    "versionId": "9b53b59a-c713-4c7d-9fab-2ee624634824",
+    "meta": {
+        "instanceId": "83b34abb32d90e19b18d30a9f5a704a7e5862aa73858f9d8f098b0bfd3132ef3"
+    },
+    "id": "tzlPksM4hLAZTvCF",
+    "tags": []
+}
